@@ -164,3 +164,11 @@ with tab4:
 
 # --- 分頁 5: 來源與備註 ---
 with tab5:
+    st.subheader("資料來源與參考文獻")
+    st.markdown("""
+    * **UAE 國防部 / Bloomberg:** 依據 UAE Defense Ministry 發布之圖表，2026/02/28 飛彈達首波高峰 (約115枚)，03/01 無人機達高峰 (332架)。
+    * **科威特 News Agency:** 外交部與國防部關於 234 枚飛彈與 422 架無人機之聲明 (2026/03/08)
+    * **巴林 NCC:** Bahrain National Communication Center 關於攔截 86 枚飛彈的媒體簡報 (2026/03/07)
+    * **CENTCOM:** 佛羅里達坦帕總部記者會，Brad Cooper 上將關於伊朗火力衰減的聲明 (2026/03/05)
+    * **FDD Long War Journal / Hudson Institute:** "Operation Epic Fury: Iran's Declining Capabilities" 分析報告
+    """)
