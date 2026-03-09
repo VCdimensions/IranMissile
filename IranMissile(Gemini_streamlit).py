@@ -1,184 +1,413 @@
-import streamlit as st
+import time
+import json
+import re
+import csv
+from urllib.parse import urlparse
+from urllib import robotparser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
+import streamlit as st
+from bs4 import BeautifulSoup
 
-# 頁面設定
-st.set_page_config(page_title="Operation Epic Fury 追蹤儀表板", layout="wide", initial_sidebar_state="collapsed")
+from openai import OpenAI  # pip install openai
 
-# 自定義 CSS (GitHub 風格)
-st.markdown("""
-    <style>
-    .stat-card {
-        background-color: #f6f8fa;
-        border: 1px solid #d0d7de;
-        border-radius: 6px;
-        padding: 16px;
-        text-align: center;
+
+st.set_page_config(page_title="Multi-URL Web Scraper UI", layout="wide")
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ResearchScraper/1.0; +https://example.com/bot)"
+}
+
+
+def normalize_url(u: str) -> str:
+    u = u.strip()
+    if not u:
+        return ""
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    return u
+
+
+def get_robots_parser(url: str, timeout: int = 10):
+    """用 requests 讀 robots.txt（含 timeout），避免 robotparser.read() 卡住。"""
+    parsed = urlparse(url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    rp = robotparser.RobotFileParser()
+    rp.set_url(robots_url)
+
+    try:
+        r = requests.get(robots_url, headers=DEFAULT_HEADERS, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+        rp.parse(r.text.splitlines())
+        return rp
+    except Exception:
+        return None
+
+
+def can_fetch(url: str, user_agent: str, obey_robots: bool, robots_cache: dict, timeout: int):
+    if not obey_robots:
+        return True, None
+
+    parsed = urlparse(url)
+    key = f"{parsed.scheme}://{parsed.netloc}"
+    if key not in robots_cache:
+        robots_cache[key] = get_robots_parser(url, timeout=timeout)
+
+    rp = robots_cache[key]
+    if rp is None:
+        return True, "robots.txt unavailable; proceeded with caution."
+
+    ok = rp.can_fetch(user_agent, url)
+    return ok, None if ok else "Blocked by robots.txt"
+
+
+def extract_page_fields(html: str, url: str, extract_tables: bool):
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    desc_tag = soup.find("meta", attrs={"name": "description"})
+    meta_desc = desc_tag.get("content", "").strip() if desc_tag else ""
+
+    h1 = soup.find("h1")
+    h1_text = h1.get_text(" ", strip=True) if h1 else ""
+
+    # 去噪音
+    for t in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
+        t.decompose()
+
+    text = soup.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    links_count = len(soup.find_all("a"))
+
+    tables = []
+    if extract_tables:
+        try:
+            dfs = pd.read_html(html)
+            for df in dfs[:5]:
+                tables.append(df.to_dict(orient="records"))
+        except Exception:
+            tables = []
+
+    snippet = text[:400] + ("..." if len(text) > 400 else "")
+
+    return {
+        "url": url,
+        "title": title,
+        "meta_description": meta_desc,
+        "h1": h1_text,
+        "full_text": text,          # ✅ CSV / GPT 用完整內文
+        "text_snippet": snippet,    # UI 總覽用摘要
+        "text_length": len(text),
+        "links_count": links_count,
+        "tables": tables,
     }
-    .stat-card-title {
-        color: #57606a;
-        font-size: 14px;
-        font-weight: 600;
-        margin-bottom: 8px;
+
+
+def fetch_one(url: str, settings: dict, robots_cache: dict):
+    t0 = time.time()
+    s = requests.Session()
+
+    headers = troubled_headers = dict(DEFAULT_HEADERS)
+    headers["User-Agent"] = settings["user_agent"]
+
+    ok, robots_note = can_fetch(
+        url=url,
+        user_agent=settings["user_agent"],
+        obey_robots=settings["obey_robots"],
+        robots_cache=robots_cache,
+        timeout=settings["timeout"],
+    )
+    if not ok:
+        return {
+            "url": url,
+            "status": "blocked",
+            "error": "Blocked by robots.txt",
+            "elapsed_s": round(time.time() - t0, 3),
+            "robots_note": None,
+        }
+
+    last_err = None
+    for _ in range(settings["retries"] + 1):
+        try:
+            if settings["delay_s"] > 0:
+                time.sleep(settings["delay_s"])
+
+            r = s.get(url, headers=headers, timeout=settings["timeout"])
+            r.raise_for_status()
+
+            data = extract_page_fields(
+                html=r.text,
+                url=url,
+                extract_tables=settings["extract_tables"],
+            )
+            return {
+                **data,
+                "status": "ok",
+                "http_status": r.status_code,
+                "elapsed_s": round(time.time() - t0, 3),
+                "robots_note": robots_note,
+                "error": None,
+            }
+        except Exception as e:
+            last_err = str(e)
+
+    return {
+        "url": url,
+        "status": "error",
+        "error": last_err,
+        "elapsed_s": round(time.time() - t0, 3),
+        "robots_note": robots_note,
     }
-    .stat-card-value {
-        color: #0969da;
-        font-size: 28px;
-        font-weight: bold;
+
+
+def build_gpt_input(results: list[dict], per_url_chars: int, total_chars: int) -> tuple[str, dict]:
+    """把多網址內容組成 GPT 輸入（含字數裁切），回傳 (text, stats)。"""
+    parts = []
+    used = 0
+    included = 0
+    skipped = 0
+
+    for r in results:
+        if r.get("status") != "ok":
+            skipped += 1
+            continue
+
+        body = (r.get("full_text") or "")
+        if per_url_chars and per_url_chars > 0:
+            body = body[:per_url_chars]
+
+        block = (
+            f"URL: {r.get('url','')}\n"
+            f"TITLE: {r.get('title','')}\n"
+            f"META: {r.get('meta_description','')}\n"
+            f"H1: {r.get('h1','')}\n"
+            f"CONTENT:\n{body}\n"
+        )
+
+        # total limit
+        if total_chars and total_chars > 0:
+            if used >= total_chars:
+                break
+            remaining = total_chars - used
+            if len(block) > remaining:
+                block = block[:remaining]
+
+        parts.append(block)
+        used += len(block)
+        included += 1
+
+        if total_chars and used >= total_chars:
+            break
+
+    text = "\n\n---\n\n".join(parts)
+    stats = {"included_ok_pages": included, "skipped_non_ok": skipped, "final_chars": len(text)}
+    return text, stats
+
+
+def send_to_gpt(api_key: str, model: str, instructions: str, input_text: str) -> str:
+    client = OpenAI(api_key=api_key)
+    # Responses API：instructions + input
+    resp = client.responses.create(
+        model=model,
+        instructions=instructions,
+        input=input_text,
+    )
+    return getattr(resp, "output_text", "") or ""
+
+
+# ---------------- UI ----------------
+st.title("Multi-URL Web Scraper → GPT")
+st.caption("多網址抓取後，匯出 CSV（含全文）或把全文送到 GPT API 做摘要/分類/抽取。")
+
+# Sidebar
+with st.sidebar:
+    st.subheader("抓取設定")
+    obey_robots = st.checkbox("遵守 robots.txt", value=True)
+    timeout = st.number_input("Timeout（秒）", min_value=3, max_value=60, value=15, step=1)
+    retries = st.number_input("重試次數", min_value=0, max_value=5, value=1, step=1)
+    delay_s = st.number_input("每次請求延遲（秒）", min_value=0.0, max_value=10.0, value=0.2, step=0.1)
+    max_workers = st.number_input("並發數（同時抓幾個）", min_value=1, max_value=30, value=8, step=1)
+    extract_tables = st.checkbox("擷取表格（read_html，最多 5 個）", value=False)
+    user_agent = st.text_input("User-Agent", value=DEFAULT_HEADERS["User-Agent"])
+
+    st.divider()
+    st.subheader("OpenAI（送到 GPT）")
+    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...（不會顯示）")
+    model = st.text_input("Model", value="gpt-5.2")
+    prompt_instructions = st.text_area(
+        "Prompt / Instructions（給模型的指令）",
+        height=160,
+        placeholder="例如：請將每個網址的內容摘要成 5 點重點，並列出可交易的關鍵事件與價格影響。",
+    )
+    per_url_chars = st.number_input("每個網址最多送出字元數", min_value=500, max_value=200000, value=8000, step=500)
+    total_chars = st.number_input("總送出字元上限", min_value=2000, max_value=500000, value=50000, step=2000)
+    auto_send = st.checkbox("抓完後自動送出到 GPT", value=False)
+
+st.subheader("輸入網址（每行一個，可多個）")
+urls_text = st.text_area(
+    label="",
+    height=180,
+    placeholder="https://example.com/page1\nhttps://example.com/page2\n...\n",
+)
+
+colA, colB = st.columns([1, 4])
+with colA:
+    run = st.button("開始抓取", type="primary")
+with colB:
+    st.write("")
+
+# state init
+if "results" not in st.session_state:
+    st.session_state["results"] = None
+if "gpt_output" not in st.session_state:
+    st.session_state["gpt_output"] = None
+if "gpt_input_stats" not in st.session_state:
+    st.session_state["gpt_input_stats"] = None
+
+if run:
+    raw = [normalize_url(x) for x in urls_text.splitlines()]
+    urls = []
+    seen = set()
+    for u in raw:
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    if not urls:
+        st.warning("請至少輸入 1 個網址（每行一個）。")
+        st.stop()
+
+    settings = {
+        "obey_robots": obey_robots,
+        "timeout": int(timeout),
+        "retries": int(retries),
+        "delay_s": float(delay_s),
+        "extract_tables": extract_tables,
+        "user_agent": user_agent.strip() or DEFAULT_HEADERS["User-Agent"],
     }
-    </style>
-""", unsafe_allow_html=True)
 
-# 標題與資料限制警告
-st.markdown("<h1 style='color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 10px;'>Operation Epic Fury 數據追蹤儀表板 (2026年3月)</h1>", unsafe_allow_html=True)
+    st.info(f"準備抓取 {len(urls)} 個網址（並發 {int(max_workers)}）")
+    progress = st.progress(0)
+    status_box = st.empty()
 
-st.warning("""
-**⚠️ 資料限制與推算說明：**
-1. **截止時間差異：** UAE、Kuwait 數據更新至 2026/03/08；Bahrain 更新至 03/07；CENTCOM 區域總量預估基於 03/05 簡報。
-2. **數據反推 (Deduction)：** 僅 UAE 國防部 (@modgovae) 提供較完整的逐日戰報。其他國家（如科威特、巴林）多為發布「累計數字」，若需進行逐日趨勢分析，需從累計總量與區域火力衰減率反推估算，可能存在誤差。
-""")
+    robots_cache = {}
+    results = []
+    done = 0
 
-# 統計摘要卡片 (Stat Cards)
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.markdown('<div class="stat-card"><div class="stat-card-title">UAE 累計攔截/偵測 (至3/8)</div><div class="stat-card-value">238 飛彈 / 1,422 無人機</div></div>', unsafe_allow_html=True)
-with col2:
-    st.markdown('<div class="stat-card"><div class="stat-card-title">科威特 累計偵測 (至3/8)</div><div class="stat-card-value">234 飛彈 / 422 無人機</div></div>', unsafe_allow_html=True)
-with col3:
-    st.markdown('<div class="stat-card"><div class="stat-card-title">巴林 累計攔截 (至3/7)</div><div class="stat-card-value">86 飛彈 / 148 無人機</div></div>', unsafe_allow_html=True)
-with col4:
-    st.markdown('<div class="stat-card"><div class="stat-card-title">區域攻勢衰減率 (Day 1 vs Day 8)</div><div class="stat-card-value" style="color:#1a7f37;">-85% ⬇</div></div>', unsafe_allow_html=True)
+    with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
+        futures = {ex.submit(fetch_one, u, settings, robots_cache): u for u in urls}
+        for fut in as_completed(futures):
+            res = fut.result()
+            results.append(res)
+            done += 1
+            progress.progress(done / len(urls))
+            status_box.write(f"完成 {done}/{len(urls)}：{res['url']} → {res.get('status')}")
 
-st.markdown("<br>", unsafe_allow_html=True)
+    st.session_state["results"] = results
+    st.session_state["gpt_output"] = None
+    st.session_state["gpt_input_stats"] = None
 
-# 準備逐日數據 (UAE)
-dates = ['3/1', '3/2', '3/3', '3/4', '3/5', '3/6', '3/7', '3/8']
-uae_m = [50, 60, 45, 3, 35, 22, 6, 17]
-uae_d = [400, 350, 200, 129, 50, 51, 125, 117]
+# If have results, show summary + export + GPT
+results = st.session_state.get("results")
+if results:
+    df = pd.DataFrame(results)
 
-df_daily = pd.DataFrame({
-    '日期': dates,
-    '飛彈數量': uae_m,
-    '無人機數量': uae_d
-})
+    df_display = df.drop(columns=[c for c in ["tables", "full_text"] if c in df.columns])
+    df_export = df.drop(columns=[c for c in ["tables"] if c in df.columns])
 
-# 計算環比與衰減
-df_daily['飛彈環比(%)'] = df_daily['飛彈數量'].pct_change() * 100
-df_daily['無人機環比(%)'] = df_daily['無人機數量'].pct_change() * 100
-df_daily['無人機衰減參考線'] = [round(400 * (0.7 ** i)) for i in range(len(dates))] # 每日衰減30%
-df_daily['火力強度(Normalized %)'] = (df_daily['無人機數量'] / 400) * 100
+    st.subheader("抓取結果（總覽）")
+    st.dataframe(df_display, use_container_width=True)
 
-# 建立分頁
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "1. UAE 逐日趨勢圖", 
-    "2. 多國累計比較", 
-    "3. 逐日數據明細表", 
-    "4. 三場衝突歷史比較", 
-    "5. 來源與備註"
-])
+    st.subheader("匯出")
+    csv_bytes = df_export.to_csv(
+        index=False,
+        encoding="utf-8-sig",
+        quoting=csv.QUOTE_ALL,  # ✅ 內文有逗號/換行不亂欄
+    ).encode("utf-8-sig")
 
-with tab1:
-    st.subheader("UAE 逐日飛彈與無人機來襲數量 (雙 Y 軸)")
-    
-    # 使用 Plotly 建立雙 Y 軸圖表
-    fig_daily = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    # 加入長條圖
-    fig_daily.add_trace(
-        go.Bar(x=df_daily['日期'], y=df_daily['飛彈數量'], name='飛彈 (左軸)', marker_color='#cf222e'),
-        secondary_y=False,
-    )
-    fig_daily.add_trace(
-        go.Bar(x=df_daily['日期'], y=df_daily['無人機數量'], name='無人機 (右軸)', marker_color='#57606a'),
-        secondary_y=True,
-    )
-    # 加入折線圖
-    fig_daily.add_trace(
-        go.Scatter(x=df_daily['日期'], y=df_daily['無人機衰減參考線'], name='無人機衰減參考線 (預期)', 
-                   line=dict(color='#d4a72c', dash='dash')),
-        secondary_y=True,
-    )
-    
-    fig_daily.update_layout(
-        template="plotly_white",
-        barmode='group',
-        hovermode="x unified",
-        margin=dict(l=20, r=20, t=40, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    fig_daily.update_yaxes(title_text="飛彈數量", secondary_y=False)
-    fig_daily.update_yaxes(title_text="無人機數量", secondary_y=True)
-    
-    st.plotly_chart(fig_daily, use_container_width=True)
+    json_bytes = json.dumps(results, ensure_ascii=False, indent=2).encode("utf-8")
 
-with tab2:
-    st.subheader("各國面臨之飛彈與無人機累計總量")
-    
-    df_compare = pd.DataFrame({
-        '國家': ['UAE (3/8)', '科威特 (3/8)', '巴林 (3/7)', '約旦 (估計)', '卡達 (估計)'],
-        '累計飛彈': [238, 234, 86, 45, 12],
-        '累計無人機': [1422, 422, 148, 80, 30]
-    })
-    
-    fig_compare = go.Figure(data=[
-        go.Bar(name='累計飛彈', y=df_compare['國家'], x=df_compare['累計飛彈'], orientation='h', marker_color='#cf222e'),
-        go.Bar(name='累計無人機', y=df_compare['國家'], x=df_compare['累計無人機'], orientation='h', marker_color='#57606a')
-    ])
-    
-    fig_compare.update_layout(
-        template="plotly_white",
-        barmode='group',
-        xaxis_title="發射數量",
-        yaxis=dict(autorange="reversed") # 讓排名第一的在最上方
-    )
-    st.plotly_chart(fig_compare, use_container_width=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "下載 CSV（含完整內文）",
+            data=csv_bytes,
+            file_name="scrape_results_fulltext.csv",
+            mime="text/csv",
+        )
+    with c2:
+        st.download_button(
+            "下載 JSON（含 tables）",
+            data=json_bytes,
+            file_name="scrape_results.json",
+            mime="application/json",
+        )
 
-with tab3:
-    st.subheader("UAE 逐日明細與環比變化 (Day-over-Day)")
-    
-    # 格式化表格的函數：紅色代表增加(攻勢變強)，綠色代表減少(攻勢衰退)
-    def color_change(val):
-        if pd.isna(val):
-            return ''
-        color = '#cf222e' if val > 0 else '#1a7f37'
-        return f'color: {color}; font-weight: bold;'
+    st.subheader("送到 GPT")
+    gpt_input_text, stats = build_gpt_input(results, int(per_url_chars), int(total_chars))
+    st.session_state["gpt_input_stats"] = stats
 
-    styled_df = df_daily[['日期', '飛彈數量', '飛彈環比(%)', '無人機數量', '無人機環比(%)']].style \
-        .map(color_change, subset=['飛彈環比(%)', '無人機環比(%)']) \
-        .format({
-            '飛彈環比(%)': '{:+.1f}%',
-            '無人機環比(%)': '{:+.1f}%'
-        }, na_rep="-")
-        
-    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+    st.write(f"將送出：成功頁數 {stats['included_ok_pages']}（跳過 {stats['skipped_non_ok']}）| 字元數 {stats['final_chars']:,}")
 
-with tab4:
-    st.subheader("三場衝突首週火力發射量比較")
-    st.caption("註: True Promise II (2024/10) 以彈道飛彈為主；12日戰爭 (2025/06) 結合了無人機蜂群；而 Epic Fury (2026/03) 則是面臨聯軍先發制人打擊下的絕望反擊，總量最高但衰減極快。")
-    
-    df_history = pd.DataFrame({
-        '衝突事件': ['True Promise II<br>(2024/10)', '12日戰爭<br>(2025/06)', 'Epic Fury<br>(2026/03)'],
-        '區域總飛彈量': [180, 300, 1050],
-        '區域總無人機量': [0, 500, 3200]
-    })
-    
-    fig_history = px.bar(
-        df_history, x='衝突事件', y=['區域總飛彈量', '區域總無人機量'],
-        barmode='group',
-        color_discrete_sequence=['#cf222e', '#57606a']
-    )
-    fig_history.update_layout(template="plotly_white", yaxis_title="發射數量", legend_title_text="武器類型")
-    st.plotly_chart(fig_history, use_container_width=True)
+    send_btn = st.button("傳送到 GPT（使用左側 API Key + Prompt）", type="secondary")
 
-with tab5:
-    st.subheader("資料來源與參考文獻")
-    st.markdown("""
-    * **UAE 國防部:** 官方 X 帳號 [@modgovae](https://twitter.com/modgovae) (2026/03/04 - 03/08 每日戰報公報)
-    * **科威特 News Agency:** 外交部與國防部關於 234 枚飛彈與 422 架無人機之聲明 (2026/03/08)
-    * **巴林 NCC:** Bahrain National Communication Center 關於攔截 86 枚飛彈的媒體簡報 (2026/03/07)
-    * **CENTCOM:** 佛羅里達坦帕總部記者會，Brad Cooper 上將關於伊朗火力衰減的聲明 (2026/03/05)
-    * **FDD Long War Journal / Hudson Institute:** "Operation Epic Fury: Iran's Declining Capabilities" 分析報告 (指出發射量下降約 70%~85%)
-    * **約旦與卡達數據:** 依據區域防空聯盟軌跡預估（非官方定案數字，僅作圖表比例參考）。
-    """)
+    if (auto_send or send_btn):
+        if not api_key:
+            st.error("左側請先輸入 OpenAI API Key")
+        elif not prompt_instructions.strip():
+            st.error("左側請先輸入 Prompt / Instructions")
+        elif not gpt_input_text.strip():
+            st.error("沒有可送出的內容（可能全部抓取失敗或被 robots 擋下）")
+        else:
+            with st.spinner("呼叫 GPT API 中…"):
+                try:
+                    out = send_to_gpt(
+                        api_key=api_key.strip(),
+                        model=model.strip(),
+                        instructions=prompt_instructions.strip(),
+                        input_text=gpt_input_text,
+                    )
+                    st.session_state["gpt_output"] = out
+                except Exception as e:
+                    st.error(f"API 呼叫失敗：{e}")
+
+    if st.session_state.get("gpt_output"):
+        st.subheader("GPT 輸出")
+        st.text_area("Output", st.session_state["gpt_output"], height=300)
+
+        md_bytes = st.session_state["gpt_output"].encode("utf-8")
+        st.download_button("下載 GPT 輸出（.md）", data=md_bytes, file_name="gpt_output.md", mime="text/markdown")
+
+    st.subheader("逐筆詳情")
+    for i, r in enumerate(results, start=1):
+        with st.expander(f"{i}. {r.get('status')} | {r.get('title','')[:60]} | {r['url']}"):
+            st.write(f"**URL**: {r['url']}")
+            st.write(f"**Status**: {r.get('status')}  |  **Elapsed(s)**: {r.get('elapsed_s')}")
+            if r.get("robots_note"):
+                st.warning(r["robots_note"])
+            if r.get("error"):
+                st.error(r["error"])
+            st.write(f"**Title**: {r.get('title','')}")
+            st.write(f"**H1**: {r.get('h1','')}")
+            st.write(f"**Meta Description**: {r.get('meta_description','')}")
+            st.write(f"**Text length**: {r.get('text_length')}")
+            st.write(f"**Links count**: {r.get('links_count')}")
+
+            st.write("**Text snippet**:")
+            st.code(r.get("text_snippet", ""), language="text")
+            st.text_area("Full text", r.get("full_text", ""), height=250)
+
+            if extract_tables:
+                tables = r.get("tables") or []
+                st.write(f"**Tables**: {len(tables)}")
+                for ti, t in enumerate(tables, start=1):
+                    st.write(f"Table {ti}")
+                    try:
+                        st.dataframe(pd.DataFrame(t), use_container_width=True)
+                    except Exception:
+                        st.json(t)
