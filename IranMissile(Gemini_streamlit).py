@@ -113,8 +113,13 @@ with tab1:
         margin=dict(l=20, r=20, t=40, b=20), 
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
-    fig_daily.update_yaxes(title_text="飛彈數量", secondary_y=False)
-    fig_daily.update_yaxes(title_text="無人機數量", secondary_y=True)
+    
+    # 取得最大值，並乘上一個比例 (1.5 與 1.2) 來拉高天花板，留出上方空間避免長條圖頂天
+    max_missile = df_daily['飛彈數量'].max()
+    max_drone = df_daily['無人機數量'].max()
+    
+    fig_daily.update_yaxes(title_text="飛彈數量", range=[0, max_missile * 1.5], secondary_y=False)
+    fig_daily.update_yaxes(title_text="無人機數量", range=[0, max_drone * 1.2], secondary_y=True)
     
     st.plotly_chart(fig_daily, use_container_width=True)
 
