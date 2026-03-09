@@ -1,4 +1,13 @@
 from __future__ import annotations
+import html
+import os
+import re
+from datetime import date, datetime
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -18,6 +27,338 @@ MUTED = "#57606a"
 LINE = "#d0d7de"
 WARN_BG = "#fff8c5"
 WARN_BORDER = "#d4a72c"
+UI_BUILD_TAG = "2026-03-09-AI-Update"
+OVERRIDE_FILE = Path(__file__).with_name("uae_daily_updates.csv")
+DEFAULT_GPT_THINKING_URL = "https://chatgpt.com/?model=gpt-5.4-thinking"
+GPT_THINKING_URL = os.getenv("GPT54_THINKING_URL", DEFAULT_GPT_THINKING_URL)
+
+MONTH_MAP = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def normalize_date(value: str) -> str | None:
+    dt = pd.to_datetime(str(value), errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.strftime("%Y-%m-%d")
+
+
+def load_daily_overrides() -> pd.DataFrame:
+    cols = ["date", "missiles", "drones", "note", "source_url", "source_kind", "updated_at"]
+    if not OVERRIDE_FILE.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(OVERRIDE_FILE, dtype=str)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols]
+
+
+def persist_daily_override(
+    date_str: str,
+    missiles: int,
+    drones: int,
+    note: str,
+    source_url: str = "",
+    source_kind: str = "manual",
+) -> None:
+    new_row = {
+        "date": date_str,
+        "missiles": str(int(missiles)),
+        "drones": str(int(drones)),
+        "note": (note or "").strip(),
+        "source_url": (source_url or "").strip(),
+        "source_kind": source_kind,
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    old = load_daily_overrides()
+    all_rows = pd.concat([old, pd.DataFrame([new_row])], ignore_index=True)
+    all_rows["date"] = all_rows["date"].apply(normalize_date)
+    all_rows = all_rows[all_rows["date"].notna()].copy()
+    all_rows["missiles"] = pd.to_numeric(all_rows["missiles"], errors="coerce").fillna(0).astype(int)
+    all_rows["drones"] = pd.to_numeric(all_rows["drones"], errors="coerce").fillna(0).astype(int)
+    all_rows = all_rows.sort_values(["date", "updated_at"]).drop_duplicates("date", keep="last")
+    all_rows.to_csv(OVERRIDE_FILE, index=False)
+
+
+def build_daily_frame(base_rows: list[dict], overrides: pd.DataFrame) -> pd.DataFrame:
+    merged: dict[str, dict] = {}
+    for r in base_rows:
+        d = normalize_date(r.get("date", ""))
+        if not d:
+            continue
+        merged[d] = {
+            "date": d,
+            "missiles": int(r.get("missiles", 0)),
+            "drones": int(r.get("drones", 0)),
+            "note": str(r.get("note", "")).strip(),
+        }
+    if not overrides.empty:
+        for r in overrides.to_dict("records"):
+            d = normalize_date(r.get("date", ""))
+            if not d:
+                continue
+            note = str(r.get("note", "")).strip() or "手動更新"
+            url = str(r.get("source_url", "")).strip()
+            if url:
+                note = f"{note}（來源：{url}）"
+            missile_val = pd.to_numeric(r.get("missiles"), errors="coerce")
+            drone_val = pd.to_numeric(r.get("drones"), errors="coerce")
+            missile_val = 0 if pd.isna(missile_val) else int(missile_val)
+            drone_val = 0 if pd.isna(drone_val) else int(drone_val)
+            merged[d] = {
+                "date": d,
+                "missiles": missile_val,
+                "drones": drone_val,
+                "note": note,
+            }
+    daily_rows = [merged[k] for k in sorted(merged)]
+    df = pd.DataFrame(daily_rows)
+    if df.empty:
+        return pd.DataFrame(columns=["date", "missiles", "drones", "note", "missiles_pct", "drones_pct", "total"])
+    prev_m = df["missiles"].shift(1)
+    prev_d = df["drones"].shift(1)
+    df["missiles_pct"] = ((df["missiles"] - prev_m) / prev_m * 100).where(prev_m != 0)
+    df["drones_pct"] = ((df["drones"] - prev_d) / prev_d * 100).where(prev_d != 0)
+    df["total"] = df["missiles"] + df["drones"]
+    return df
+
+
+def strip_html_text(raw_html: str) -> str:
+    txt = re.sub(r"<script[\s\S]*?</script>", " ", raw_html, flags=re.IGNORECASE)
+    txt = re.sub(r"<style[\s\S]*?</style>", " ", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = html.unescape(txt)
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+def parse_article_date(text: str) -> str | None:
+    patterns = [
+        r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s*(\d{1,2})\s+([A-Za-z]+)\s+(20\d{2})\b",
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+),\s*(20\d{2})\b",
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        day = int(m.group(1))
+        month = MONTH_MAP.get(m.group(2).lower())
+        year = int(m.group(3))
+        if not month:
+            continue
+        try:
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def parse_daily_counts(text: str) -> tuple[int | None, int | None]:
+    combo = re.search(
+        r"today[^.]{0,240}?detected\s+(\d{1,4})\s+ballistic missiles[^.]{0,260}?(?:a total of\s+)?(\d{1,4})\s+drones?\s+were also detected",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if combo:
+        return int(combo.group(1)), int(combo.group(2))
+
+    m_missile = re.search(r"today[^.]{0,220}?detected\s+(\d{1,4})\s+ballistic missiles", text, flags=re.IGNORECASE)
+    m_drone = re.search(r"(?:a total of\s+)?(\d{1,4})\s+drones?\s+were also detected", text, flags=re.IGNORECASE)
+    missiles = int(m_missile.group(1)) if m_missile else None
+    drones = int(m_drone.group(1)) if m_drone else None
+
+    if missiles is None:
+        m_fallback = re.search(r"intercept(?:ed|s)\s+(\d{1,4})\s+ballistic missiles", text, flags=re.IGNORECASE)
+        if m_fallback:
+            missiles = int(m_fallback.group(1))
+    if drones is None:
+        d_fallback = re.search(r"intercept(?:ed|s)\s+\d{1,4}\s+ballistic missiles,\s*(\d{1,4})\s+drones", text, flags=re.IGNORECASE)
+        if d_fallback:
+            drones = int(d_fallback.group(1))
+    return missiles, drones
+
+
+def parse_date_from_url(url: str) -> str | None:
+    parsed = urlparse(url.strip())
+    q = parse_qs(parsed.query)
+    # QNA 常見 date=8/03/2026 格式
+    for d in q.get("date", []):
+        dt = pd.to_datetime(d, errors="coerce", dayfirst=True)
+        if not pd.isna(dt):
+            return dt.strftime("%Y-%m-%d")
+    m = re.search(r"/(20\d{2})-(\d{1,2})/(\d{1,2})(?:/|$)", parsed.path)
+    if m:
+        year, month, day = map(int, m.groups())
+        try:
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
+
+def parse_counts_from_generic_text(text: str) -> tuple[int | None, int | None]:
+    missile_patterns = [
+        r"(\d{1,4})\s+(?:ballistic\s+)?missiles?",
+        r"(\d{1,4})\s+rockets?",
+        r"(\d{1,4})\s*飛彈",
+    ]
+    drone_patterns = [
+        r"(\d{1,4})\s+drones?",
+        r"(\d{1,4})\s*無人機",
+    ]
+    missiles = None
+    drones = None
+    for p in missile_patterns:
+        ms = re.findall(p, text, flags=re.IGNORECASE)
+        if ms:
+            missiles = int(ms[0])
+            break
+    for p in drone_patterns:
+        ds = re.findall(p, text, flags=re.IGNORECASE)
+        if ds:
+            drones = int(ds[0])
+            break
+    return missiles, drones
+
+
+def parse_counts_from_url(url: str) -> tuple[int | None, int | None]:
+    path = unquote(urlparse(url.strip()).path.lower())
+    pair = re.search(r"missiles-(\d{1,4}).{0,24}?drones?-(\d{1,4})", path)
+    if pair:
+        return int(pair.group(1)), int(pair.group(2))
+    pair_rev = re.search(r"drones?-(\d{1,4}).{0,24}?missiles-(\d{1,4})", path)
+    if pair_rev:
+        return int(pair_rev.group(2)), int(pair_rev.group(1))
+    missiles = None
+    drones = None
+    return missiles, drones
+
+
+def parse_from_source_metadata(url: str, source_groups: list[dict]) -> dict | None:
+    target = url.strip().rstrip("/")
+    for group in source_groups:
+        for item in group.get("items", []):
+            source_url = str(item.get("url", "")).strip().rstrip("/")
+            if source_url != target:
+                continue
+            title = str(item.get("title", ""))
+            use = str(item.get("use", ""))
+            date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", f"{title} {use}")
+            parsed_date = normalize_date(date_match.group(1)) if date_match else None
+            missiles, drones = parse_counts_from_generic_text(use)
+            if missiles is None or drones is None:
+                m2, d2 = parse_counts_from_generic_text(title)
+                missiles = missiles if missiles is not None else m2
+                drones = drones if drones is not None else d2
+            return {
+                "date": parsed_date,
+                "missiles": missiles,
+                "drones": drones,
+                "note": "來源清單備援解析",
+                "source_url": target,
+            }
+    return None
+
+
+def backfill_from_existing(
+    parsed_date: str | None,
+    missiles: int | None,
+    drones: int | None,
+    df_daily: pd.DataFrame,
+) -> tuple[int | None, int | None]:
+    if not parsed_date:
+        return missiles, drones
+    row = df_daily[df_daily["date"] == parsed_date]
+    if row.empty:
+        return missiles, drones
+    if missiles is None:
+        missiles = int(row.iloc[0]["missiles"])
+    if drones is None:
+        drones = int(row.iloc[0]["drones"])
+    return missiles, drones
+
+
+def fetch_daily_from_article(url: str, source_groups: list[dict], df_daily: pd.DataFrame) -> dict:
+    source_url = url.strip()
+    parsed_date = parse_date_from_url(source_url)
+    missiles, drones = parse_counts_from_url(source_url)
+    note = "來源頁面自動解析"
+
+    try:
+        req = Request(source_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=18) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+        html_text = raw.decode(charset, errors="ignore")
+        text = strip_html_text(html_text)
+        if len(text) > 120:
+            parsed_date = parse_article_date(text) or parsed_date
+            m1, d1 = parse_daily_counts(text)
+            m2, d2 = parse_counts_from_generic_text(text)
+            missiles = missiles if missiles is not None else m1
+            drones = drones if drones is not None else d1
+            missiles = missiles if missiles is not None else m2
+            drones = drones if drones is not None else d2
+    except Exception:
+        pass
+
+    meta = parse_from_source_metadata(source_url, source_groups)
+    if meta:
+        parsed_date = parsed_date or meta["date"]
+        missiles = missiles if missiles is not None else meta["missiles"]
+        drones = drones if drones is not None else meta["drones"]
+        note = "來源頁面 + 來源清單備援解析"
+
+    before_m, before_d = missiles, drones
+    missiles, drones = backfill_from_existing(parsed_date, missiles, drones, df_daily)
+    if (before_m is None or before_d is None) and (missiles is not None and drones is not None):
+        note = "來源備援解析（同日既有資料補齊）"
+    if parsed_date and missiles is not None and drones is not None:
+        return {
+            "date": parsed_date,
+            "missiles": missiles,
+            "drones": drones,
+            "note": note,
+            "source_url": source_url,
+        }
+    raise ValueError(
+        f"無法完整解析（date={parsed_date or 'N/A'}, missiles={missiles}, drones={drones}）。"
+        "請改用下方「手動補登最近一日」。"
+    )
+
+
+def make_gpt_prompt(df_daily: pd.DataFrame) -> str:
+    latest = df_daily.iloc[-1]
+    lines = [
+        "你是軍事與情報分析助理，請用結構化方式延伸分析。",
+        f"最新日期：{latest['date']}",
+        f"最新日數據：飛彈 {int(latest['missiles'])}，無人機 {int(latest['drones'])}",
+        f"期間累計：飛彈 {int(df_daily['missiles'].sum())}，無人機 {int(df_daily['drones'].sum())}",
+        "請完成：",
+        "1) 近 3 日趨勢與可能原因",
+        "2) 與前一週平均相比的變化百分比",
+        "3) 明日風險等級（高/中/低）與依據",
+        "4) 需要補查的來源清單（按優先順序）",
+        "請用繁體中文，先給 3 行重點摘要，再給詳細分析。",
+    ]
+    return "\n".join(lines)
 
 st.markdown(
     f"""
@@ -181,8 +522,8 @@ source_groups = [
     ]},
 ]
 
-df_daily = pd.DataFrame(uae_daily)
-df_countries = pd.DataFrame(countries)
+override_df = load_daily_overrides()
+df_daily = build_daily_frame(uae_daily, override_df)
 df_history = pd.DataFrame(history_data)
 
 def pct_str(v):
@@ -193,13 +534,23 @@ def pct_str(v):
 def fmt_int(v):
     return f"{int(v):,}"
 
-df_daily['total'] = df_daily['missiles'] + df_daily['drones']
-sum_missiles = int(df_daily['missiles'].sum())
-sum_drones = int(df_daily['drones'].sum())
-peak_row = df_daily.loc[df_daily['total'].idxmax()]
-country_total_m = int(df_countries['missiles'].sum())
-country_total_d = int(df_countries['drones'].sum())
-cutoff_label = " · ".join([f"{r.country}:{r.cutoff[5:]}" for r in df_countries.itertuples()])
+sum_missiles = int(df_daily["missiles"].sum())
+sum_drones = int(df_daily["drones"].sum())
+peak_row = df_daily.loc[df_daily["total"].idxmax()]
+latest_date = str(df_daily["date"].max())
+start_date = str(df_daily["date"].min())
+range_label = f"{pd.to_datetime(start_date).strftime('%m/%d')}–{pd.to_datetime(latest_date).strftime('%m/%d')}"
+
+df_countries = pd.DataFrame(countries)
+uae_mask = df_countries["country"] == "UAE"
+if uae_mask.any():
+    df_countries.loc[uae_mask, "missiles"] = sum_missiles
+    df_countries.loc[uae_mask, "drones"] = sum_drones
+    df_countries.loc[uae_mask, "cutoff"] = latest_date
+    df_countries.loc[uae_mask, "note"] = "由 UAE 逐日資料自動累計（含最新更新）"
+country_total_m = int(df_countries["missiles"].sum())
+country_total_d = int(df_countries["drones"].sum())
+cutoff_label = " · ".join([f"{r.country}:{str(r.cutoff)[5:]}" for r in df_countries.itertuples()])
 
 date_labels_full = [d.replace('-', '/') for d in df_daily['date'].tolist()]
 date_labels_short = [pd.to_datetime(d).strftime('%m/%d') for d in df_daily['date']]
@@ -211,11 +562,12 @@ st.markdown("""
   <div class="warning-box"><strong>資料限制警告：</strong> 各國官方公布的截止時間不同，且公開口徑並不一致。UAE 為逐日官方公告；Kuwait、Bahrain、Jordan 多為累計口徑；Qatar 的最新累計需由 3/3 官方累計加上 3/5、3/8 逐日公告反推。比較圖請視為「截至各自最新可驗證 cutoff 的並列快照」，不可直接視為同一時間點的精確同步截面。</div>
 </div>
 """, unsafe_allow_html=True)
+st.caption(f"介面版本：{UI_BUILD_TAG}")
 
 m1, m2 = st.columns(2)
 m3, m4 = st.columns(2)
-m1.metric("UAE 期間飛彈（2/28–3/8）", fmt_int(sum_missiles), help="逐日官方統計合計")
-m2.metric("UAE 期間無人機（2/28–3/8）", fmt_int(sum_drones), help="逐日官方統計合計")
+m1.metric(f"UAE 期間飛彈（{range_label}）", fmt_int(sum_missiles), help="逐日官方統計合計")
+m2.metric(f"UAE 期間無人機（{range_label}）", fmt_int(sum_drones), help="逐日官方統計合計")
 m3.metric("UAE 峰值日", peak_row['date'].replace('-', '/'), help=f"{int(peak_row['missiles'])} 枚飛彈 / {int(peak_row['drones'])} 架無人機")
 m4.metric("CENTCOM 區域總量（下限）", ">2,500", help=">500 missiles + >2,000 drones")
 
@@ -225,11 +577,12 @@ section_options = [
     "3. 數據表",
     "4. 三場衝突歷史比較",
     "5. 來源連結",
+    "6. AI 延伸與最近日更新",
 ]
-section = st.selectbox("頁面導覽", section_options, index=0)
+section = st.selectbox("頁面導覽", section_options, index=5)
 
 if section == "1. Epic Fury 逐日圖表":
-    st.subheader("UAE 逐日圖表（2026/02/28–03/08）")
+    st.subheader(f"UAE 逐日圖表（{start_date.replace('-', '/')}–{latest_date.replace('-', '/')}）")
     st.caption("雙 Y 軸 bar chart：左軸 = 飛彈、右軸 = 無人機。")
     fig = go.Figure()
     fig.add_bar(
@@ -288,7 +641,7 @@ if section == "1. Epic Fury 逐日圖表":
 
 elif section == "2. 多國比較":
     st.subheader("多國比較（截至各國最新可驗證 cutoff）")
-    st.caption("橫向 bar chart；UAE 為官方 3/8 累計，Kuwait 採 3/6 官方累計，Bahrain 採 3/8 官方累計，Jordan 採 3/7 官方記者會，Qatar 採 3/3 官方累計 + 3/5、3/8 日報反推。")
+    st.caption("橫向 bar chart；UAE 由逐日資料自動累計至最新日，其他國家維持各自最新可驗證 cutoff。")
     st.markdown(f"<div class='chip-row'><div class='chip'>已追蹤國家合計飛彈：<strong>{country_total_m:,}</strong></div><div class='chip'>已追蹤國家合計無人機：<strong>{country_total_d:,}</strong></div><div class='chip'>cutoff：<strong>{cutoff_label}</strong></div></div>", unsafe_allow_html=True)
     compare = go.Figure()
     compare.add_bar(y=df_countries['country'], x=df_countries['missiles'], name='飛彈', orientation='h', marker_color=BLUE)
@@ -367,4 +720,62 @@ elif section == "5. 來源連結":
     if count == 0:
         st.info("沒有符合的來源，請換個關鍵字。")
 
-st.markdown("<div class='small-muted' style='margin-top:14px;'>部署提醒：上傳到 Streamlit Community Cloud 時，主程式請選 app.py；theme 已透過 .streamlit/config.toml 預設為白底藍色系。</div>", unsafe_allow_html=True)
+elif section == "6. AI 延伸與最近日更新":
+    st.subheader("AI 延伸與最近日更新")
+    st.caption("可連結 GPT-5.4 Thinking 進行延伸分析，並把 UAE 逐日資料更新到最近一日。")
+    st.markdown(f"<div class='chip-row'><div class='chip'>目前最新日：<strong>{latest_date}</strong></div><div class='chip'>更新檔：<strong>{OVERRIDE_FILE.name}</strong></div></div>", unsafe_allow_html=True)
+    st.link_button("開啟 GPT-5.4 Thinking", GPT_THINKING_URL)
+    st.text_area("建議貼給 GPT 的分析提示詞", value=make_gpt_prompt(df_daily), height=210)
+
+    st.markdown("### A. 來源網址自動解析（建議）")
+    default_source_url = source_groups[0]["items"][-1]["url"] if source_groups and source_groups[0]["items"] else ""
+    source_url = st.text_input("官方來源網址（WAM / QNA 等）", value=default_source_url, key="auto_update_source")
+    if st.button("自動解析並更新到最近一日", type="primary"):
+        try:
+            parsed = fetch_daily_from_article(source_url, source_groups, df_daily)
+            parsed_dt = pd.to_datetime(parsed["date"]).date()
+            latest_dt = pd.to_datetime(latest_date).date()
+            persist_daily_override(
+                parsed["date"],
+                parsed["missiles"],
+                parsed["drones"],
+                parsed["note"],
+                source_url=parsed["source_url"],
+                source_kind="auto",
+            )
+            if parsed_dt > latest_dt:
+                st.success(f"已新增 {parsed['date']}：飛彈 {parsed['missiles']}、無人機 {parsed['drones']}。")
+            elif parsed_dt == latest_dt:
+                st.success(f"已覆寫 {parsed['date']}：飛彈 {parsed['missiles']}、無人機 {parsed['drones']}。")
+            else:
+                st.warning(f"已寫入較早日期 {parsed['date']}（用於修正舊資料）。")
+            st.rerun()
+        except (HTTPError, URLError) as e:
+            st.error(f"來源抓取失敗：{e}")
+        except ValueError as e:
+            st.error(f"解析失敗：{e}")
+        except Exception as e:
+            st.error(f"更新失敗：{e}")
+
+    st.markdown("### B. 手動補登最近一日（備援）")
+    with st.form("manual_daily_update_form", clear_on_submit=False):
+        default_manual_date = max(pd.to_datetime(latest_date).date(), date.today())
+        input_date = st.date_input("日期", value=default_manual_date)
+        c1, c2 = st.columns(2)
+        missiles_val = c1.number_input("飛彈數量", min_value=0, step=1, value=0)
+        drones_val = c2.number_input("無人機數量", min_value=0, step=1, value=0)
+        note = st.text_input("備註", value="手動更新")
+        submitted = st.form_submit_button("儲存手動更新")
+        if submitted:
+            persist_daily_override(
+                input_date.strftime("%Y-%m-%d"),
+                int(missiles_val),
+                int(drones_val),
+                note.strip() or "手動更新",
+                source_url="",
+                source_kind="manual",
+            )
+            st.success("已儲存，資料已可用於圖表與統計。")
+            st.rerun()
+
+st.markdown("<div class='small-muted' style='margin-top:14px;'>執行提醒：請用 <code>streamlit run IranMissile.py</code>（或 <code>streamlit run app.py</code>）。若你開的是 <code>IranMissile.html</code>，不會有 AI 更新功能。</div>", unsafe_allow_html=True)
