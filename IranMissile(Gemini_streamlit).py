@@ -2,7 +2,7 @@ from __future__ import annotations
 import html
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
@@ -295,6 +295,102 @@ def backfill_from_existing(
     return missiles, drones
 
 
+def fetch_text(url: str, timeout: int = 20) -> str:
+    req = Request(url.strip(), headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        charset = resp.headers.get_content_charset() or "utf-8"
+    return raw.decode(charset, errors="ignore")
+
+
+def parse_wam_sitemap_entries(xml_text: str) -> list[dict]:
+    pattern = re.compile(
+        r"<url>\s*<loc>(?P<loc>[^<]+)</loc>.*?<image:title>(?P<title>[^<]*)</image:title>.*?<lastmod>(?P<lastmod>[^<]+)</lastmod>.*?</url>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    entries: list[dict] = []
+    for m in pattern.finditer(xml_text):
+        loc = html.unescape(m.group("loc").strip())
+        title = html.unescape(m.group("title").strip())
+        lastmod = m.group("lastmod").strip()
+        dt = pd.to_datetime(lastmod, errors="coerce")
+        date_str = None if pd.isna(dt) else dt.strftime("%Y-%m-%d")
+        entries.append(
+            {
+                "url": loc,
+                "title": title,
+                "lastmod": lastmod,
+                "date": date_str,
+            }
+        )
+    return entries
+
+
+def find_wam_daily_entry(target_date: date | None = None) -> dict | None:
+    base = "https://www.wam.ae/en/sitemap/articles/{year}/{month}.xml"
+    today = date.today()
+    if target_date is None:
+        target_date = today - timedelta(days=1)
+    months = {(target_date.year, target_date.month), (today.year, today.month)}
+    if target_date.month == 1:
+        months.add((target_date.year - 1, 12))
+    else:
+        months.add((target_date.year, target_date.month - 1))
+
+    all_entries: list[dict] = []
+    for year, month in sorted(months):
+        url = base.format(year=year, month=month)
+        try:
+            xml_text = fetch_text(url, timeout=22)
+            all_entries.extend(parse_wam_sitemap_entries(xml_text))
+        except Exception:
+            continue
+
+    if not all_entries:
+        return None
+
+    candidate_entries: list[dict] = []
+    for e in all_entries:
+        title = e["title"].lower()
+        if "uae air defences" not in title:
+            continue
+        if "ballistic missile" not in title:
+            continue
+        missiles, drones = parse_counts_from_generic_text(e["title"])
+        if missiles is None or drones is None:
+            continue
+        date_str = e.get("date")
+        if not date_str:
+            continue
+        candidate_entries.append(
+            {
+                "date": date_str,
+                "missiles": missiles,
+                "drones": drones,
+                "note": "WAM sitemap 標題自動解析",
+                "source_url": e["url"],
+                "lastmod": e["lastmod"],
+            }
+        )
+
+    if not candidate_entries:
+        return None
+
+    target_str = target_date.strftime("%Y-%m-%d")
+    exact = [e for e in candidate_entries if e["date"] == target_str]
+    if exact:
+        exact.sort(key=lambda x: x["lastmod"], reverse=True)
+        return exact[0]
+
+    older = [e for e in candidate_entries if e["date"] < target_str]
+    if older:
+        older.sort(key=lambda x: x["date"], reverse=True)
+        return older[0]
+
+    candidate_entries.sort(key=lambda x: x["date"], reverse=True)
+    return candidate_entries[0]
+
+
 def fetch_daily_from_article(url: str, source_groups: list[dict], df_daily: pd.DataFrame) -> dict:
     source_url = url.strip()
     parsed_date = parse_date_from_url(source_url)
@@ -343,22 +439,6 @@ def fetch_daily_from_article(url: str, source_groups: list[dict], df_daily: pd.D
         "請改用下方「手動補登最近一日」。"
     )
 
-
-def make_gpt_prompt(df_daily: pd.DataFrame) -> str:
-    latest = df_daily.iloc[-1]
-    lines = [
-        "你是軍事與情報分析助理，請用結構化方式延伸分析。",
-        f"最新日期：{latest['date']}",
-        f"最新日數據：飛彈 {int(latest['missiles'])}，無人機 {int(latest['drones'])}",
-        f"期間累計：飛彈 {int(df_daily['missiles'].sum())}，無人機 {int(df_daily['drones'].sum())}",
-        "請完成：",
-        "1) 近 3 日趨勢與可能原因",
-        "2) 與前一週平均相比的變化百分比",
-        "3) 明日風險等級（高/中/低）與依據",
-        "4) 需要補查的來源清單（按優先順序）",
-        "請用繁體中文，先給 3 行重點摘要，再給詳細分析。",
-    ]
-    return "\n".join(lines)
 
 st.markdown(
     f"""
@@ -571,19 +651,96 @@ m2.metric(f"UAE 期間無人機（{range_label}）", fmt_int(sum_drones), help="
 m3.metric("UAE 峰值日", peak_row['date'].replace('-', '/'), help=f"{int(peak_row['missiles'])} 枚飛彈 / {int(peak_row['drones'])} 架無人機")
 m4.metric("CENTCOM 區域總量（下限）", ">2,500", help=">500 missiles + >2,000 drones")
 
+
+def render_update_tools(panel_key: str) -> None:
+    st.markdown("### 圖表旁更新工具")
+    target_auto_date = date.today() - timedelta(days=1)
+    st.caption(f"會優先抓取 {target_auto_date.strftime('%Y-%m-%d')}（昨日）資料；若該日無可解析來源，才退回你填的網址。")
+    c_left, c_right = st.columns([3, 1.2])
+    source_url = c_left.text_input(
+        "官方來源網址（選填；昨日自動抓不到時才使用）",
+        value="",
+        key=f"auto_update_source_{panel_key}",
+    )
+    c_right.link_button("開啟 GPT-5.4 Thinking", GPT_THINKING_URL, use_container_width=True)
+    if st.button("自動解析並更新到最近一日", type="primary", key=f"auto_update_btn_{panel_key}", use_container_width=True):
+        try:
+            manual_url = source_url.strip()
+            auto = find_wam_daily_entry(target_auto_date)
+            if auto:
+                parsed = {
+                    "date": auto["date"],
+                    "missiles": auto["missiles"],
+                    "drones": auto["drones"],
+                    "note": auto["note"],
+                    "source_url": auto["source_url"],
+                }
+            elif manual_url:
+                parsed = fetch_daily_from_article(manual_url, source_groups, df_daily)
+            else:
+                raise ValueError("無法從 WAM sitemap 找到可解析的 UAE 每日條目，且未提供備援網址。")
+
+            parsed_dt = pd.to_datetime(parsed["date"]).date()
+            latest_dt = pd.to_datetime(latest_date).date()
+            persist_daily_override(
+                parsed["date"],
+                parsed["missiles"],
+                parsed["drones"],
+                parsed["note"],
+                source_url=parsed["source_url"],
+                source_kind="auto",
+            )
+            if parsed_dt > latest_dt:
+                st.success(f"已新增 {parsed['date']}：飛彈 {parsed['missiles']}、無人機 {parsed['drones']}。")
+            elif parsed_dt == latest_dt:
+                st.success(f"已覆寫 {parsed['date']}：飛彈 {parsed['missiles']}、無人機 {parsed['drones']}。")
+            else:
+                st.warning(f"已寫入較早日期 {parsed['date']}（用於修正舊資料）。")
+            if parsed_dt != target_auto_date:
+                st.info(f"昨日 {target_auto_date.strftime('%Y-%m-%d')} 未取得可解析條目，已回退到最近可用日 {parsed['date']}。")
+            st.rerun()
+        except (HTTPError, URLError) as e:
+            st.error(f"來源抓取失敗：{e}")
+        except ValueError as e:
+            st.error(f"解析失敗：{e}")
+        except Exception as e:
+            st.error(f"更新失敗：{e}")
+
+    with st.expander("手動補登最近一日（備援）", expanded=False):
+        with st.form(f"manual_daily_update_form_{panel_key}", clear_on_submit=False):
+            default_manual_date = max(pd.to_datetime(latest_date).date(), date.today())
+            input_date = st.date_input("日期", value=default_manual_date, key=f"manual_date_{panel_key}")
+            c1, c2 = st.columns(2)
+            missiles_val = c1.number_input("飛彈數量", min_value=0, step=1, value=0, key=f"manual_m_{panel_key}")
+            drones_val = c2.number_input("無人機數量", min_value=0, step=1, value=0, key=f"manual_d_{panel_key}")
+            note = st.text_input("備註", value="手動更新", key=f"manual_note_{panel_key}")
+            submitted = st.form_submit_button("儲存手動更新")
+            if submitted:
+                persist_daily_override(
+                    input_date.strftime("%Y-%m-%d"),
+                    int(missiles_val),
+                    int(drones_val),
+                    note.strip() or "手動更新",
+                    source_url="",
+                    source_kind="manual",
+                )
+                st.success("已儲存，資料已可用於圖表與統計。")
+                st.rerun()
+
+
 section_options = [
     "1. Epic Fury 逐日圖表",
     "2. 多國比較",
     "3. 數據表",
     "4. 三場衝突歷史比較",
     "5. 來源連結",
-    "6. AI 延伸與最近日更新",
 ]
-section = st.selectbox("頁面導覽", section_options, index=5)
+section = st.selectbox("頁面導覽", section_options, index=0)
 
 if section == "1. Epic Fury 逐日圖表":
     st.subheader(f"UAE 逐日圖表（{start_date.replace('-', '/')}–{latest_date.replace('-', '/')}）")
     st.caption("雙 Y 軸 bar chart：左軸 = 飛彈、右軸 = 無人機。")
+    render_update_tools("chart")
     fig = go.Figure()
     fig.add_bar(
         x=date_labels_full,
@@ -719,63 +876,5 @@ elif section == "5. 來源連結":
             st.markdown(f"<div class='note-box' style='margin-bottom:10px;'><div><a href='{item['url']}' target='_blank'>{item['title']}</a></div><div class='small-muted'>{item['use']}</div></div>", unsafe_allow_html=True)
     if count == 0:
         st.info("沒有符合的來源，請換個關鍵字。")
-
-elif section == "6. AI 延伸與最近日更新":
-    st.subheader("AI 延伸與最近日更新")
-    st.caption("可連結 GPT-5.4 Thinking 進行延伸分析，並把 UAE 逐日資料更新到最近一日。")
-    st.markdown(f"<div class='chip-row'><div class='chip'>目前最新日：<strong>{latest_date}</strong></div><div class='chip'>更新檔：<strong>{OVERRIDE_FILE.name}</strong></div></div>", unsafe_allow_html=True)
-    st.link_button("開啟 GPT-5.4 Thinking", GPT_THINKING_URL)
-    st.text_area("建議貼給 GPT 的分析提示詞", value=make_gpt_prompt(df_daily), height=210)
-
-    st.markdown("### A. 來源網址自動解析（建議）")
-    default_source_url = source_groups[0]["items"][-1]["url"] if source_groups and source_groups[0]["items"] else ""
-    source_url = st.text_input("官方來源網址（WAM / QNA 等）", value=default_source_url, key="auto_update_source")
-    if st.button("自動解析並更新到最近一日", type="primary"):
-        try:
-            parsed = fetch_daily_from_article(source_url, source_groups, df_daily)
-            parsed_dt = pd.to_datetime(parsed["date"]).date()
-            latest_dt = pd.to_datetime(latest_date).date()
-            persist_daily_override(
-                parsed["date"],
-                parsed["missiles"],
-                parsed["drones"],
-                parsed["note"],
-                source_url=parsed["source_url"],
-                source_kind="auto",
-            )
-            if parsed_dt > latest_dt:
-                st.success(f"已新增 {parsed['date']}：飛彈 {parsed['missiles']}、無人機 {parsed['drones']}。")
-            elif parsed_dt == latest_dt:
-                st.success(f"已覆寫 {parsed['date']}：飛彈 {parsed['missiles']}、無人機 {parsed['drones']}。")
-            else:
-                st.warning(f"已寫入較早日期 {parsed['date']}（用於修正舊資料）。")
-            st.rerun()
-        except (HTTPError, URLError) as e:
-            st.error(f"來源抓取失敗：{e}")
-        except ValueError as e:
-            st.error(f"解析失敗：{e}")
-        except Exception as e:
-            st.error(f"更新失敗：{e}")
-
-    st.markdown("### B. 手動補登最近一日（備援）")
-    with st.form("manual_daily_update_form", clear_on_submit=False):
-        default_manual_date = max(pd.to_datetime(latest_date).date(), date.today())
-        input_date = st.date_input("日期", value=default_manual_date)
-        c1, c2 = st.columns(2)
-        missiles_val = c1.number_input("飛彈數量", min_value=0, step=1, value=0)
-        drones_val = c2.number_input("無人機數量", min_value=0, step=1, value=0)
-        note = st.text_input("備註", value="手動更新")
-        submitted = st.form_submit_button("儲存手動更新")
-        if submitted:
-            persist_daily_override(
-                input_date.strftime("%Y-%m-%d"),
-                int(missiles_val),
-                int(drones_val),
-                note.strip() or "手動更新",
-                source_url="",
-                source_kind="manual",
-            )
-            st.success("已儲存，資料已可用於圖表與統計。")
-            st.rerun()
 
 st.markdown("<div class='small-muted' style='margin-top:14px;'>執行提醒：請用 <code>streamlit run IranMissile.py</code>（或 <code>streamlit run app.py</code>）。若你開的是 <code>IranMissile.html</code>，不會有 AI 更新功能。</div>", unsafe_allow_html=True)
